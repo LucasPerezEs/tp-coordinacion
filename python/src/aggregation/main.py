@@ -53,7 +53,7 @@ class AggregationFilter:
         fruit_top = [(it.fruit, it.amount) for it in top_items]
 
         # Send result to Join instance with client_id
-        self.output_queue.send(message_protocol.internal.serialize(client_id, fruit_top))
+        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
         
         # Cleanup
         self.amounts_by_client.pop(client_id, None)
