@@ -18,6 +18,10 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+        self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, "sum_control", ["EOFs"]
+        )
+
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -63,8 +67,10 @@ class SumFilter:
             return
         ack()
 
+
     def start(self):
         self.input_queue.start_consuming(self.process_data_messsage)
+        self.sum_control_exchange.start_consuming(self.process_data_messsage)
 
 def main():
     logging.basicConfig(level=logging.INFO)
