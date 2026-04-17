@@ -18,9 +18,13 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
-        self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOFs"]
-        )
+        try:
+            self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOFs"]
+            )
+        except Exception as e:
+            logging.exception("Failed to create Sum Exchange Control Middleware")
+            return
 
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
@@ -100,7 +104,7 @@ class SumFilter:
             try:
                 self.sum_control_exchange.send(message_protocol.internal.serialize([fields[0]]))
             except Exception as e:
-                logging.error("Failed to publish control EOF: %s", e)
+                logging.exception("Failed to publish control EOF")
             ack()
             return
 
