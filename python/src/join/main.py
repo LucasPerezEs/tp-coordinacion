@@ -23,10 +23,43 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
+        self.top_partials_by_client = {}  # {client_id: []}
+
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) != 2:
+            logging.warning(f"Unexpected message format: {message}")
+            nack()
+            return
+        
+        client_id, partial_top = fields
+
+        client_tops = self.top_partials_by_client.setdefault(client_id, [])
+        client_tops.append(partial_top)
+
+        # Wait until all partial tops from client are received from Aggregators
+        if len(client_tops) < AGGREGATION_AMOUNT:
+            ack()
+            return
+
+        # Merge partial tops into final top
+        totals = {}
+        for partial in client_tops:
+            for fruit, amount in partial:
+                totals[fruit] = totals.get(fruit, 0) + int(amount)
+        
+        items = [fruit_item.FruitItem(f, a) for f, a in totals.items()]
+        items.sort(reverse=True)
+        top_items = items[:TOP_SIZE]
+        fruit_top = [(it.fruit, it.amount) for it in top_items]
+
+        # Send result including client_id
+        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+        
+        # Cleanup state
+        del self.top_partials_by_client[client_id]
+        
         ack()
 
     def start(self):
