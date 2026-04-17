@@ -19,7 +19,7 @@ class SumFilter:
             MOM_HOST, INPUT_QUEUE
         )
         self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, "sum_control", ["EOFs"]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOFs"]
         )
 
         self.data_output_exchanges = []
@@ -31,16 +31,21 @@ class SumFilter:
 
         self.fruit_sum_by_client = {}
 
+        self.lock = threading.Lock()
+
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
-        client_map = self.fruit_sum_by_client.setdefault(client_id, {})
-        client_map[fruit] = client_map.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+        with self.lock:
+            client_map = self.fruit_sum_by_client.setdefault(client_id, {})
+            client_map[fruit] = client_map.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _process_eof(self, client_id):
         logging.info(f"Broadcasting data messages")
-        client_map = self.fruit_sum_by_client.get(client_id, {})
+        with self.lock:
+            client_map = self.fruit_sum_by_client.get(client_id, {})
+
         for final_fruit_item in client_map.values():
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(
@@ -53,24 +58,65 @@ class SumFilter:
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
-        self.fruit_sum_by_client.pop(client_id, None)
+        with self.lock:
+            self.fruit_sum_by_client.pop(client_id, None)
 
+
+    def _control_callback(self, message, ack, nack):
+        try:
+            fields = message_protocol.internal.deserialize(message)
+        except Exception as e:
+            logging.error("Failed when deserializing message: %s", e)
+            nack()
+            return
+
+        if len(fields) == 1:
+            client_id = fields[0]
+            logging.info(f"Control EOF received for client {client_id}")
+            self._process_eof(client_id)
+            ack()
+        else:
+            logging.warning(f"Unknown message format: {fields}")
+            nack()
+            return
+            
 
     def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
+
+        try:
+            fields = message_protocol.internal.deserialize(message)
+        except Exception as e:
+            logging.error("Failed when deserializing message: %s", e)
+            nack()
+            return
+
         if len(fields) == 3:
             self._process_data(*fields)
+            ack()
+
         elif len(fields) == 1:
-            self._process_eof(fields[0])
+            client_id = fields[0]
+            logging.info(f"Publishing control EOF for client {client_id}")
+            try:
+                self.sum_control_exchange.send(message_protocol.internal.serialize([fields[0]]))
+            except Exception as e:
+                logging.error("Failed to publish control EOF: %s", e)
+            ack()
+            return
+
         else:
             logging.warning(f"Unknown message format: {fields}")
             return
-        ack()
 
 
     def start(self):
+        control_thread = threading.Thread(target = lambda: 
+                            self.sum_control_exchange.start_consuming(self._control_callback), 
+                            daemon=True
+        ) # Mas tarde hacer un graceful shutdown handleando sigterm
+        control_thread.start()
         self.input_queue.start_consuming(self.process_data_messsage)
-        self.sum_control_exchange.start_consuming(self.process_data_messsage)
+        
 
 def main():
     logging.basicConfig(level=logging.INFO)
