@@ -24,7 +24,7 @@ class SumFilter:
             )
         except Exception as e:
             logging.exception("Failed to create Sum Exchange Control Middleware")
-            return
+            raise
 
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
@@ -36,6 +36,8 @@ class SumFilter:
         self.fruit_sum_by_client = {}
 
         self.lock = threading.Lock()
+        self.inflight = 0
+        self.pending_eofs = set()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
@@ -77,6 +79,12 @@ class SumFilter:
         if len(fields) == 1:
             client_id = fields[0]
             logging.info(f"Control EOF received for client {client_id}")
+            with self.lock:
+                if self.inflight > 0:
+                    logging.info("Currently processing data. Deferring EOF.")
+                    self.pending_eofs.add(client_id)
+                    ack()
+                    return
             self._process_eof(client_id)
             ack()
         else:
@@ -87,31 +95,45 @@ class SumFilter:
 
     def process_data_messsage(self, message, ack, nack):
 
+        with self.lock:
+            self.inflight += 1
+
         try:
-            fields = message_protocol.internal.deserialize(message)
-        except Exception as e:
-            logging.error("Failed when deserializing message: %s", e)
-            nack()
-            return
-
-        if len(fields) == 3:
-            self._process_data(*fields)
-            ack()
-
-        elif len(fields) == 1:
-            client_id = fields[0]
-            logging.info(f"Publishing control EOF for client {client_id}")
             try:
-                self.sum_control_exchange.send(message_protocol.internal.serialize([fields[0]]))
+                fields = message_protocol.internal.deserialize(message)
             except Exception as e:
-                logging.exception("Failed to publish control EOF")
-            ack()
-            return
+                logging.error("Failed when deserializing message: %s", e)
+                nack()
+                return
 
-        else:
-            logging.warning(f"Unknown message format: {fields}")
-            return
+            if len(fields) == 3:
+                self._process_data(*fields)
+                ack()
 
+            elif len(fields) == 1:
+                client_id = fields[0]
+                logging.info(f"Publishing control EOF for client {client_id}")
+                try:
+                    self.sum_control_exchange.send(message_protocol.internal.serialize([fields[0]]))
+                except Exception as e:
+                    logging.exception("Failed to publish control EOF")
+                ack()
+                return
+
+            else:
+                logging.warning(f"Unknown message format: {fields}")
+                return
+        finally:
+            with self.lock:
+                self.inflight -= 1
+                if self.inflight == 0:
+                    pending = list(self.pending_eofs)
+                    self.pending_eofs.clear()
+                else:
+                    pending = []
+
+        for client_id in pending:
+            self._process_eof(client_id)                    
 
     def start(self):
         control_thread = threading.Thread(target = lambda: 
