@@ -56,7 +56,6 @@ class SumFilter:
             ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _process_eof(self, client_id):
-        logging.info(f"Broadcasting data messages")
         with self.lock:
             client_map = self.fruit_sum_by_client.get(client_id, {})
 
@@ -72,8 +71,12 @@ class SumFilter:
                 )
             )
 
-        logging.info(f"Broadcasting EOF message")
-        data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+        logging.info(f"Sending EOF message to Aggregator")
+        try:
+            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+        except Exception:
+            logging.exception("Error when sending EOF message to Aggregator")
+            raise
 
         with self.lock:
             self.fruit_sum_by_client.pop(client_id, None)
@@ -96,8 +99,12 @@ class SumFilter:
                     self.pending_eofs.add(client_id)
                     ack()
                     return
-            self._process_eof(client_id)
-            ack()
+            try:
+                self._process_eof(client_id)
+                ack()
+            except Exception:
+                nack()
+                return
         else:
             logging.warning(f"Unknown message format: {fields}")
             nack()
@@ -126,12 +133,11 @@ class SumFilter:
                 logging.info(f"Publishing control EOF for client {client_id}")
                 try:
                     self.sum_control_publisher.send(message_protocol.internal.serialize([fields[0]]))
-                    ack() 
-                    return
                 except Exception as e:
                     logging.exception("Failed to publish control EOF")
                     nack()
                     return
+                ack() 
 
             else:
                 logging.warning(f"Unknown message format: {fields}")
