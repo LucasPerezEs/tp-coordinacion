@@ -35,7 +35,7 @@ class AggregationFilter:
         ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _process_eof(self, client_id):
-        logging.info("Received EOF")
+        logging.info(f"Received EOF for client {client_id}")
         
         # Increment EOF counter for this client
         self.eof_count_by_client.setdefault(client_id, 0)
@@ -43,6 +43,7 @@ class AggregationFilter:
 
         # Wait until all Sum replicas send their EOFs
         if self.eof_count_by_client[client_id] < SUM_AMOUNT:
+            logging.info("Not all EOFs for this client arrived yet")
             return
 
         # Build top fruits from accumulated map for this client
@@ -54,7 +55,8 @@ class AggregationFilter:
 
         # Send result to Join instance with client_id
         self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
-        
+        logging.info(f"Sending partial top of client {client_id}")
+
         # Cleanup
         self.amounts_by_client.pop(client_id, None)
         self.eof_count_by_client.pop(client_id, None)
