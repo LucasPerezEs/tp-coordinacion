@@ -54,8 +54,12 @@ class AggregationFilter:
         fruit_top = [(it.fruit, it.amount) for it in top_items]
 
         # Send result to Join instance with client_id
-        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
-        logging.info(f"Sending partial top of client {client_id}")
+        try:
+            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+            logging.info(f"Sending partial top of client {client_id}")
+        except Exception as e:
+            logging.exception("Error while sending partial top of client %s", client_id)
+            raise
 
         # Cleanup
         self.amounts_by_client.pop(client_id, None)
@@ -67,7 +71,11 @@ class AggregationFilter:
         if len(fields) == 3:
             self._process_data(*fields)
         elif len(fields) == 1:
-            self._process_eof(fields[0])
+            try:
+                self._process_eof(fields[0])
+            except Exception:
+                nack()
+                return
         else:
             logging.warning(f"Unknown message format: {fields}")
             return
