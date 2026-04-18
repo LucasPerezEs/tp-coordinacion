@@ -19,8 +19,15 @@ class SumFilter:
             MOM_HOST, INPUT_QUEUE
         )
         try:
-            self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, SUM_CONTROL_EXCHANGE, ["EOFs"]
+            self.sum_control_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, 
+                SUM_CONTROL_EXCHANGE, 
+                ["EOFs"]
+            )
+            self.sum_control_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, 
+                SUM_CONTROL_EXCHANGE, 
+                ["EOFs"]
             )
         except Exception as e:
             logging.exception("Failed to create Sum Exchange Control Middleware")
@@ -114,7 +121,7 @@ class SumFilter:
                 client_id = fields[0]
                 logging.info(f"Publishing control EOF for client {client_id}")
                 try:
-                    self.sum_control_exchange.send(message_protocol.internal.serialize([fields[0]]))
+                    self.sum_control_publisher.send(message_protocol.internal.serialize([fields[0]]))
                 except Exception as e:
                     logging.exception("Failed to publish control EOF")
                 ack()
@@ -137,7 +144,7 @@ class SumFilter:
 
     def start(self):
         control_thread = threading.Thread(target = lambda: 
-                            self.sum_control_exchange.start_consuming(self._control_callback), 
+                            self.sum_control_consumer.start_consuming(self._control_callback), 
                             daemon=True
         ) # Mas tarde hacer un graceful shutdown handleando sigterm
         control_thread.start()
