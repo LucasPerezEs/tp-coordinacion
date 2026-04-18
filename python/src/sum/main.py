@@ -126,13 +126,16 @@ class SumFilter:
                 logging.info(f"Publishing control EOF for client {client_id}")
                 try:
                     self.sum_control_publisher.send(message_protocol.internal.serialize([fields[0]]))
+                    ack() 
+                    return
                 except Exception as e:
                     logging.exception("Failed to publish control EOF")
-                ack()
-                return
+                    nack()
+                    return
 
             else:
                 logging.warning(f"Unknown message format: {fields}")
+                nack()
                 return
         finally:
             with self.lock:

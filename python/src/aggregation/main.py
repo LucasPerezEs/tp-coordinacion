@@ -65,24 +65,26 @@ class AggregationFilter:
         self.amounts_by_client.pop(client_id, None)
         self.eof_count_by_client.pop(client_id, None)
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
+            ack()
         elif len(fields) == 1:
             try:
                 self._process_eof(fields[0])
+                ack()
             except Exception:
                 nack()
                 return
         else:
             logging.warning(f"Unknown message format: {fields}")
+            nack()
             return
-        ack()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.start_consuming(self.process_message)
 
 
 def main():
