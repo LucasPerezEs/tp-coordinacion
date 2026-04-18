@@ -23,44 +23,31 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
-        self.top_partials_by_client = {}  # {client_id: []}
-
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
-        fields = message_protocol.internal.deserialize(message)
+        try:
+            fields = message_protocol.internal.deserialize(message)
+        except Exception:
+            logging.exception("Failed to deserialize message")
+            nack()
+            return
+        
         if len(fields) != 2:
             logging.warning(f"Unexpected message format: {message}")
             nack()
             return
         
-        client_id, partial_top = fields
-
-        client_tops = self.top_partials_by_client.setdefault(client_id, [])
-        client_tops.append(partial_top)
-
-        # Wait until all partial tops from client are received from Aggregators
-        if len(client_tops) < AGGREGATION_AMOUNT:
-            ack()
-            return
-
-        # Merge partial tops into final top
-        totals = {}
-        for partial in client_tops:
-            for fruit, amount in partial:
-                totals[fruit] = totals.get(fruit, 0) + int(amount)
-        
-        items = [fruit_item.FruitItem(f, a) for f, a in totals.items()]
-        items.sort(reverse=True)
-        top_items = items[:TOP_SIZE]
-        fruit_top = [(it.fruit, it.amount) for it in top_items]
+        client_id, fruit_top = fields
 
         # Send result including client_id
-        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
-        
-        # Cleanup state
-        del self.top_partials_by_client[client_id]
-        
-        ack()
+        try:
+            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+            logging.info("Forwarded top for client %s", client_id)
+            ack()
+        except Exception:
+            logging.exception("Failed to forward top for client %s", client_id)
+            nack()
+            return
 
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)

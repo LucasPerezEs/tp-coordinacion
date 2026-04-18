@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import hashlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -59,17 +60,20 @@ class SumFilter:
         with self.lock:
             client_map = self.fruit_sum_by_client.get(client_id, {})
 
+        # Select Aggregator to send client data
+        h = int(hashlib.md5(client_id.encode()).hexdigest(), 16)
+        idx = h % AGGREGATION_AMOUNT
+        data_output_exchange = self.data_output_exchanges[idx]
+
         for final_fruit_item in client_map.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+            data_output_exchange.send(
+                message_protocol.internal.serialize(
+                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
                 )
+            )
 
         logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+        data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
         with self.lock:
             self.fruit_sum_by_client.pop(client_id, None)
