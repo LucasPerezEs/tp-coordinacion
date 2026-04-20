@@ -1,6 +1,7 @@
 import os
 import logging
-import bisect
+import signal
+import threading
 
 from common import middleware, message_protocol, fruit_item
 
@@ -25,6 +26,8 @@ class AggregationFilter:
         )
         self.amounts_by_client = {}  # {client_id: {fruit: FruitItem}}
         self.eof_count_by_client = {}  # {client_id: 0}
+
+        self.shutdown = threading.Event()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info("Processing data message")
@@ -83,8 +86,30 @@ class AggregationFilter:
             nack()
             return
 
+    def _on_sigterm(self, signum, frame):
+        logging.info("SIGTERM received, shutting down aggregation")
+        self.shutdown.set()
+        try:
+            self.input_exchange.stop_consuming()
+        except Exception:
+            pass
+
+    def _cleanup(self):
+        try: 
+            self.output_queue.close()
+        except: 
+            pass
+        try: 
+            self.input_exchange.close()
+        except: 
+            pass
+
     def start(self):
-        self.input_exchange.start_consuming(self.process_message)
+        signal.signal(signal.SIGTERM, lambda s,f: self._on_sigterm(s,f))
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        finally:
+            self._cleanup()
 
 
 def main():
