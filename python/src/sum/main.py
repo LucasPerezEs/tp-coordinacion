@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import hashlib
+import signal
 
 from sender import Sender
 from common import middleware, message_protocol, fruit_item
@@ -45,6 +46,8 @@ class SumFilter:
         self.fruit_sum_by_client = {}
 
         self.sender = Sender(MOM_HOST, AGGREGATION_PREFIX, AGGREGATION_AMOUNT)
+
+        self.shutdown_event = threading.Event()
 
         self.lock = threading.Lock()
         self.inflight = 0
@@ -164,7 +167,31 @@ class SumFilter:
                     pending = []
 
         for client_id in pending:
-            self._process_eof(client_id)                    
+            self._process_eof(client_id)
+
+    def _on_sigterm(self, signum, frame):
+        logging.info("SIGTERM received, initiating graceful shutdown")
+        # mark shutdown so other logic can check it if necessary
+        try:
+            self.shutdown_event.set()
+        except Exception:
+            pass
+
+        # stop consumers so start_consuming can return
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.sum_control_consumer.stop_consuming()
+        except Exception:
+            pass
+
+        # stop sender to avoid further publishes
+        try:
+            self.sender.stop()
+        except Exception:
+            pass                 
 
     def start(self):
         self.sender.start()
@@ -179,6 +206,7 @@ class SumFilter:
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
+    signal.signal(signal.SIGTERM, lambda s, f: sum_filter._on_sigterm(s, f))
     sum_filter.start()
     return 0
 
