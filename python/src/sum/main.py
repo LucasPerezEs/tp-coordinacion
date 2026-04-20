@@ -3,6 +3,7 @@ import logging
 import threading
 import hashlib
 
+from sender import Sender
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
@@ -43,6 +44,8 @@ class SumFilter:
 
         self.fruit_sum_by_client = {}
 
+        self.sender = Sender(MOM_HOST, AGGREGATION_PREFIX, AGGREGATION_AMOUNT)
+
         self.lock = threading.Lock()
         self.inflight = 0
         self.pending_eofs = set()
@@ -57,29 +60,37 @@ class SumFilter:
 
     def _process_eof(self, client_id):
         with self.lock:
-            client_map = self.fruit_sum_by_client.get(client_id, {})
+            client_map = self.fruit_sum_by_client.pop(client_id, {})
 
         # Select Aggregator to send client data
         h = int(hashlib.md5(client_id.encode()).hexdigest(), 16)
         idx = h % AGGREGATION_AMOUNT
-        data_output_exchange = self.data_output_exchanges[idx]
 
+
+        # Build payload
+        payloads = []
         for final_fruit_item in client_map.values():
-            data_output_exchange.send(
-                message_protocol.internal.serialize(
-                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                )
+            payloads.append(
+                message_protocol.internal.serialize([
+                    client_id, final_fruit_item.fruit, final_fruit_item.amount
+                ])
             )
+        
+        # Append EOF
+        payloads.append(message_protocol.internal.serialize([client_id]))
 
-        logging.info(f"Sending EOF message to Aggregator")
         try:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+            logging.info("Sending batch for client %s to aggregator %d (items=%d)", client_id, idx, len(client_map))
+            self.sender.send(idx, payloads, timeout=10)
+            logging.info("Batch sent for client %s to aggregator %d", client_id, idx)
         except Exception:
-            logging.exception("Error when sending EOF message to Aggregator")
+            logging.exception("Failed to send batch for client %s, restoring state", client_id)
+            # restore the client data so we can retry later
+            with self.lock:
+                existing = self.fruit_sum_by_client.setdefault(client_id, {})
+                for fruit, item in client_map.items():
+                    existing[fruit] = existing.get(fruit, fruit_item.FruitItem(fruit, 0)) + item
             raise
-
-        with self.lock:
-            self.fruit_sum_by_client.pop(client_id, None)
 
 
     def _control_callback(self, message, ack, nack):
@@ -101,10 +112,10 @@ class SumFilter:
                     return
             try:
                 self._process_eof(client_id)
-                ack()
             except Exception:
                 nack()
                 return
+            ack()
         else:
             logging.warning(f"Unknown message format: {fields}")
             nack()
@@ -156,6 +167,7 @@ class SumFilter:
             self._process_eof(client_id)                    
 
     def start(self):
+        self.sender.start()
         control_thread = threading.Thread(target = lambda: 
                             self.sum_control_consumer.start_consuming(self._control_callback), 
                             daemon=True
