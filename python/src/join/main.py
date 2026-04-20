@@ -1,5 +1,7 @@
 import os
 import logging
+import signal
+import threading
 
 from common import middleware, message_protocol, fruit_item
 
@@ -22,6 +24,8 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+
+        self.shutdown = threading.Event()
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
@@ -49,8 +53,31 @@ class JoinFilter:
             nack()
             return
 
+    def _on_sigterm(self, signum, frame):
+        logging.info("SIGTERM received, shutting down joiner")
+        self.shutdown.set()
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+
+    def _cleanup(self):
+        try: 
+            self.output_queue.close()
+        except: 
+            pass
+        try: 
+            self.input_exchange.close()
+        except: 
+            pass
+
+
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        signal.signal(signal.SIGTERM, lambda s,f: self._on_sigterm(s,f))
+        try:
+            self.input_queue.start_consuming(self.process_messsage)
+        finally:
+            self._cleanup()
 
 
 def main():
