@@ -16,7 +16,7 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-SAFE_EOF_BACKOFF_SEC = 0.2
+SAFE_EOF_BACKOFF_SEC = 1
 SAFE_EOF_MAX_RETRIES = 3
 DATA_FIELDS = 3
 CONTROL_FIELDS = 1
@@ -112,34 +112,46 @@ class SumFilter:
 
 
     def _process_eof(self, client_id):
+        """
+        Flush a client's accumulated fruit totals to aggregators.
+
+        Atomically take and mark the client's state as flushing, route each (client,fruit) 
+        to an aggregator using hash(client_id:fruit), 
+        append a control EOF to every aggregator, and publish per-aggregator batches via the Sender. 
+        
+        If any publish fails, restore the client's state and raise.
+        """
         # Take ownership of this client's accumulated data and mark flushing
         client_map = self._start_flush(client_id)
 
-        # Select Aggregator to send client data
-        h = int(hashlib.md5(client_id.encode()).hexdigest(), 16)
-        idx = h % AGGREGATION_AMOUNT
-
-
-        # Build payload
-        payloads = []
+        # Group payloads per aggregator idx based on hash(client_id:fruit)
+        per_idx_payloads = {i: [] for i in range(AGGREGATION_AMOUNT)}
         for final_fruit_item in client_map.values():
             logging.info("Fruit item for client %s: %s", client_id, final_fruit_item)
-            payloads.append(
+            key = f"{client_id}:{final_fruit_item.fruit}"
+            h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+            idx = h % AGGREGATION_AMOUNT
+
+            per_idx_payloads[idx].append(
                 message_protocol.internal.serialize([
                     client_id, final_fruit_item.fruit, final_fruit_item.amount
                 ])
             )
         
-        # Append EOF
-        payloads.append(message_protocol.internal.serialize([client_id]))
+        # Append EOF payload to every aggregator
+        eof_payload = message_protocol.internal.serialize([client_id])
+        for i in range(AGGREGATION_AMOUNT):
+            per_idx_payloads[i].append(eof_payload)
+
 
         try:
-            logging.info("Sending batch for client %s to aggregator %d (items=%d)", client_id, idx, len(client_map))
-            self.sender.send(idx, payloads, timeout=10)
-            logging.info("Batch sent for client %s to aggregator %d", client_id, idx)
+            for idx in range(AGGREGATION_AMOUNT):
+                payloads = per_idx_payloads[idx]
+                logging.info("Sending batch for client %s to aggregator %d (items=%d)", client_id, idx, max(0, len(payloads) - 1))
+                self.sender.send(idx, payloads, timeout=10)
+                logging.info("Batch sent for client %s to aggregator %d", client_id, idx)
         except Exception:
             logging.exception("Failed to send batch for client %s, restoring state", client_id)
-            # restore the client data so we can retry later
             self._restore_after_failed_flush(client_id, client_map)
             raise
 

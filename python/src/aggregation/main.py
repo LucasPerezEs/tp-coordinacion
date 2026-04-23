@@ -58,9 +58,9 @@ class AggregationFilter:
 
         logging.info("Partial built for %s: %s", client_id, fruit_top)
 
-        # Send result to Join instance with client_id
+        # Send result to Join instance with client_id and agg_id
         try:
-            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+            self.output_queue.send(message_protocol.internal.serialize([client_id, ID, fruit_top]))
             logging.info(f"Sending partial top of client {client_id}")
         except Exception as e:
             logging.exception("Error while sending partial top of client %s", client_id)
