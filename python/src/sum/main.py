@@ -3,6 +3,7 @@ import logging
 import threading
 import hashlib
 import signal
+import time
 
 from sender import Sender
 from common import middleware, message_protocol, fruit_item
@@ -15,6 +16,10 @@ SUM_PREFIX = os.environ["SUM_PREFIX"]
 SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+SAFE_EOF_BACKOFF_SEC = 0.2
+SAFE_EOF_MAX_RETRIES = 3
+DATA_FIELDS = 3
+CONTROL_FIELDS = 1
 
 class SumFilter:
     def __init__(self):
@@ -50,20 +55,65 @@ class SumFilter:
         self.shutdown_event = threading.Event()
 
         self.lock = threading.Lock()
-        self.inflight = 0
+        self.inflight_by_client = {}
         self.pending_eofs = set()
+        self.sent_eofs = set()
+        self.flushing = set()
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data")
+        logging.info("Process data")
         with self.lock:
+            if client_id in self.sent_eofs or client_id in self.flushing:
+                logging.error("Data received for already flushed client %s", client_id)
+                return
+
             client_map = self.fruit_sum_by_client.setdefault(client_id, {})
             client_map[fruit] = client_map.get(
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self, client_id):
+
+    def _safe_wait_for_client_eof(self, client_id, attempts=SAFE_EOF_MAX_RETRIES, interval=SAFE_EOF_BACKOFF_SEC):
+        """Return True if no inflight messages for client_id after rechecks, False if inflight appeared."""
+        for _ in range(attempts):
+            with self.lock:
+                if self.inflight_by_client.get(client_id, 0) > 0:
+                    return False
+            time.sleep(interval)
+        return True
+
+
+    def _start_flush(self, client_id):
+        """Atomically pop client data and mark client as flushing.
+        Returns the popped client_map (may be empty dict).
+        """
         with self.lock:
             client_map = self.fruit_sum_by_client.pop(client_id, {})
+            self.flushing.add(client_id)
+        return client_map
+    
+
+    def _finish_flush(self, client_id):
+        """Mark client as fully flushed (move flushing -> sent_eofs) and clean up flushing set."""
+        with self.lock:
+            self.sent_eofs.add(client_id)
+            if client_id in self.flushing:
+                self.flushing.remove(client_id)
+
+
+    def _restore_after_failed_flush(self, client_id, client_map):
+        """Restore client_map into fruit_sum_by_client and clear flushing flag after a failed send."""
+        with self.lock:
+            if client_id in self.flushing:
+                self.flushing.remove(client_id)
+            existing = self.fruit_sum_by_client.setdefault(client_id, {})
+            for fruit, item in client_map.items():
+                existing[fruit] = existing.get(fruit, fruit_item.FruitItem(fruit, 0)) + item
+
+
+    def _process_eof(self, client_id):
+        # Take ownership of this client's accumulated data and mark flushing
+        client_map = self._start_flush(client_id)
 
         # Select Aggregator to send client data
         h = int(hashlib.md5(client_id.encode()).hexdigest(), 16)
@@ -73,6 +123,7 @@ class SumFilter:
         # Build payload
         payloads = []
         for final_fruit_item in client_map.values():
+            logging.info("Fruit item for client %s: %s", client_id, final_fruit_item)
             payloads.append(
                 message_protocol.internal.serialize([
                     client_id, final_fruit_item.fruit, final_fruit_item.amount
@@ -89,14 +140,20 @@ class SumFilter:
         except Exception:
             logging.exception("Failed to send batch for client %s, restoring state", client_id)
             # restore the client data so we can retry later
-            with self.lock:
-                existing = self.fruit_sum_by_client.setdefault(client_id, {})
-                for fruit, item in client_map.items():
-                    existing[fruit] = existing.get(fruit, fruit_item.FruitItem(fruit, 0)) + item
+            self._restore_after_failed_flush(client_id, client_map)
             raise
+
+        # mark as sent only after successful send
+        self._finish_flush(client_id)
 
 
     def _control_callback(self, message, ack, nack):
+        """
+        Handle EOF control messages. 
+        Defer if client has in-flight data, else wait briefly then flush.
+        """
+
+        # Deserialize message
         try:
             fields = message_protocol.internal.deserialize(message)
         except Exception as e:
@@ -104,33 +161,45 @@ class SumFilter:
             nack()
             return
 
-        if len(fields) == 1:
+        if len(fields) == CONTROL_FIELDS:
             client_id = fields[0]
             logging.info(f"Control EOF received for client {client_id}")
             with self.lock:
-                if self.inflight > 0:
+                if self.inflight_by_client.get(client_id, 0) > 0:
                     logging.info("Currently processing data. Deferring EOF.")
                     self.pending_eofs.add(client_id)
                     ack()
                     return
+
+            if not self._safe_wait_for_client_eof(client_id):
+                logging.info("Currently processing data. Deferring EOF.")
+                self.pending_eofs.add(client_id)
+                ack()
+                return
+                
             try:
                 self._process_eof(client_id)
+                ack()
             except Exception:
+                logging.exception("Failed processing EOF of client %s", client_id)
                 nack()
-                return
-            ack()
+
         else:
             logging.warning(f"Unknown message format: {fields}")
             nack()
             return
             
 
-    def process_data_messsage(self, message, ack, nack):
-
-        with self.lock:
-            self.inflight += 1
+    def _process_data_message(self, message, ack, nack):
+        """
+        Process data or local EOF messages. 
+        Maintain per-client in-flight counts and run deferred EOFs.
+        """
+        client_id = None
+        eofs_to_process = []
 
         try:
+            # Deserialize message
             try:
                 fields = message_protocol.internal.deserialize(message)
             except Exception as e:
@@ -138,15 +207,23 @@ class SumFilter:
                 nack()
                 return
 
-            if len(fields) == 3:
+            if len(fields) == 0:
+                return
+
+            client_id = fields[0]
+
+            # Increment inflight count for this client
+            with self.lock:
+                self.inflight_by_client[client_id] = self.inflight_by_client.get(client_id, 0) + 1
+
+            if len(fields) == DATA_FIELDS:
                 self._process_data(*fields)
                 ack()
 
-            elif len(fields) == 1:
-                client_id = fields[0]
+            elif len(fields) == CONTROL_FIELDS:
                 logging.info(f"Publishing control EOF for client {client_id}")
                 try:
-                    self.sum_control_publisher.send(message_protocol.internal.serialize([fields[0]]))
+                    self.sum_control_publisher.send(message_protocol.internal.serialize([client_id]))
                 except Exception as e:
                     logging.exception("Failed to publish control EOF")
                     nack()
@@ -158,16 +235,33 @@ class SumFilter:
                 nack()
                 return
         finally:
+        # decrement per-client inflight counter and collect any deferred EOFs to process
             with self.lock:
-                self.inflight -= 1
-                if self.inflight == 0:
-                    pending = list(self.pending_eofs)
-                    self.pending_eofs.clear()
-                else:
-                    pending = []
+                if client_id is not None:
+                    cnt = self.inflight_by_client.get(client_id, 0) - 1
+                    if cnt <= 0:
+                        # remove counter and trigger pending EOF for this client only if present
+                        self.inflight_by_client.pop(client_id, None)
+                        if client_id in self.pending_eofs:
+                            self.pending_eofs.remove(client_id)
+                            eofs_to_process.append(client_id)
+                    else:
+                        self.inflight_by_client[client_id] = cnt
 
-        for client_id in pending:
-            self._process_eof(client_id)
+            # process deferred EOFs outside the lock to avoid deadlock
+            for cid in eofs_to_process:
+                if self.shutdown_event.is_set():
+                    logging.info("Shutdown in progress, deferring EOF for client %s", cid)
+                    with self.lock:
+                        self.pending_eofs.add(cid)
+                    continue
+                else:
+                    try:
+                        logging.info("Processing deferred EOF for client %s", cid)
+                        self._process_eof(cid)
+                    except Exception:
+                        logging.exception("Deferred _process_eof failed for client %s", cid)
+
 
     def _on_sigterm(self, signum, frame):
         logging.info("SIGTERM received, initiating graceful shutdown")
@@ -189,18 +283,25 @@ class SumFilter:
 
         # stop sender to avoid further publishes
         try:
-            self.sender.stop()
+            self.sender.stop(wait=True, timeout=10)
         except Exception:
-            pass                 
+            pass
+
+        # wait for control thread to exit (it was started non-daemon)
+        try:
+            if hasattr(self, "control_thread"):
+                self.control_thread.join(timeout=5)
+        except Exception:
+            pass
 
     def start(self):
         self.sender.start()
-        control_thread = threading.Thread(target = lambda: 
+        self.control_thread = threading.Thread(target = lambda: 
                             self.sum_control_consumer.start_consuming(self._control_callback), 
-                            daemon=True
-        ) # Mas tarde hacer un graceful shutdown handleando sigterm
-        control_thread.start()
-        self.input_queue.start_consuming(self.process_data_messsage)
+                            daemon=False
+        )
+        self.control_thread.start()
+        self.input_queue.start_consuming(self._process_data_message)
         
 
 def main():

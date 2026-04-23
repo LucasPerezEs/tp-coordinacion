@@ -46,7 +46,7 @@ class AggregationFilter:
 
         # Wait until all Sum replicas send their EOFs
         if self.eof_count_by_client[client_id] < SUM_AMOUNT:
-            logging.info("Not all EOFs for this client arrived yet")
+            logging.info("Not all EOFs for this client arrived yet: %u/%u", self.eof_count_by_client[client_id], SUM_AMOUNT)
             return
 
         # Build top fruits from accumulated map for this client
@@ -55,6 +55,8 @@ class AggregationFilter:
         items.sort(reverse=True)
         top_items = items[:TOP_SIZE]
         fruit_top = [(it.fruit, it.amount) for it in top_items]
+
+        logging.info("Partial built for %s: %s", client_id, fruit_top)
 
         # Send result to Join instance with client_id
         try:
